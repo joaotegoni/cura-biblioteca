@@ -111,8 +111,10 @@ begin
   Result := Exec('powershell.exe', Cmd, '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResCode);
 end;
 
-{ Roda o install.ps1 -Uninstall -Force, oculto (mesmo comportamento do antigo
-  [UninstallRun]) - devolve o exit code real do script. }
+{ Roda o install.ps1 -Uninstall -Force, oculto (mesmo comportamento da antiga
+  secao UninstallRun) - devolve o exit code real do script. Nota: linha de
+  comentario NUNCA pode comecar com "[" - o compilador le como tag de secao
+  mesmo dentro de Code. }
 function RunUninstallScript(ScriptPath: String; var ResCode: Integer): Boolean;
 var
   Cmd: String;
