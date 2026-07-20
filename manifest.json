@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "biblioteca_version": "9.0.0",
+  "min_sketchup": 2017,
+  "plugins": [
+    {
+      "id": "cura-ferramentas",
+      "name": "cura | ferramentas",
+      "version": "0.8.0",
+      "file": "cura-ferramentas.rbz",
+      "url": null,
+      "sha256": "e7c5013df3b822d11e32c0d34e2ce4a4b6df59a32fddedc4d358fbb41c1e7b4e",
+      "roots": [
+        "cura_ferramentas",
+        "cura_ferramentas.rb"
+      ]
+    }
+  ],
+  "fonts": null,
+  "remove": [
+    "TT_Lib2",
+    "TT_Lib2.rb",
+    "TT_Lib²",
+    "tt_lib2.rb",
+    "TT_CleanUp",
+    "tt_cleanup",
+    "tt_cleanup.rb",
+    "TT_EdgeTools",
+    "tt_edgetools",
+    "tt_edgetools.rb"
+  ]
+}

@@ -1,0 +1,90 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  manifest:
+    name: verifica manifest.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: recalcula sha256 (tools/make_manifest.py)
+        run: python3 tools/make_manifest.py
+
+      - name: sobe manifest.json atualizado
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: manifest.json
+          if-no-files-found: error
+
+  windows-installer:
+    name: compila instalador windows
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: instala inno setup
+        run: choco install innosetup -y --no-progress
+
+      - name: versao do instalador (tag sem "v")
+        id: ver
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: compila installer.iss
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ steps.ver.outputs.version }}" windows\installer.iss
+
+      - name: sobe BibliotecaCURA-Setup.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: windows/Output/BibliotecaCURA-Setup.exe
+          if-no-files-found: error
+
+  release:
+    name: publica release no github
+    needs: [manifest, windows-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: baixa manifest.json atualizado
+        uses: actions/download-artifact@v4
+        with:
+          name: manifest
+          path: .
+
+      - name: baixa instalador windows
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: windows/Output
+
+      - name: publica release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: false
+          files: |
+            windows/Output/BibliotecaCURA-Setup.exe
+            payload/cura-ferramentas.rbz
+            payload/fonts.zip
+            manifest.json
+            scripts/install.sh
+            scripts/install.ps1
