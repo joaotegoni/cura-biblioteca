@@ -5,7 +5,7 @@
 # sem mapfile/readarray, sem ${var,,}. Ver SPEC.md na raiz do repo.
 #
 # Uso:
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joaotegoni/cura-biblioteca/main/scripts/install.sh)"
+#   /bin/bash -c "$(curl -fsSL https://github.com/joaotegoni/cura-biblioteca/releases/latest/download/install.sh)"
 #   ./install.sh --uninstall
 #
 # Variaveis de ambiente:
@@ -30,10 +30,25 @@ SNAPSHOT_PATH="$CURA_STATE_DIR/installed.json"
 LOG_PATH="$CURA_STATE_DIR/install.log"
 FONTS_DIR="$HOME/Library/Fonts"
 
+# launchagent de auto-update (registrado so em instalacao interativa — ver
+# register_updater). caminho fica sob $HOME, entao testes com HOME isolado nao
+# tocam o launchd real da maquina.
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+UPDATER_LABEL="com.cura.biblioteca.updater"
+UPDATER_PLIST="$LAUNCH_AGENTS_DIR/$UPDATER_LABEL.plist"
+
+# flags aceitos em $1/$2, independentes e em qualquer ordem. o launchagent de
+# auto-update chama "curl ... | bash -s -- --quiet", entao --quiet chega como
+# $1; --uninstall e uso manual. varremos os dois primeiros args pra nao
+# depender de posicao.
 UNINSTALL=0
-if [ "${1:-}" = "--uninstall" ]; then
-  UNINSTALL=1
-fi
+QUIET=0
+for _arg in "${1:-}" "${2:-}"; do
+  case "$_arg" in
+    --uninstall) UNINSTALL=1 ;;
+    --quiet) QUIET=1 ;;
+  esac
+done
 
 # ---------------------------------------------------------------------------
 # Cores (identidade visual CURA — só quando stdout é tty; sem tty = plain)
@@ -86,7 +101,10 @@ log_header() {
 }
 
 say() {
-  printf '%s\n' "$1"
+  # em quiet (auto-update sem terminal) so o log recebe — nada no stdout.
+  if [ "$QUIET" != "1" ]; then
+    printf '%s\n' "$1"
+  fi
   log "$1"
 }
 
@@ -96,6 +114,10 @@ err() {
 }
 
 banner() {
+  # sem banner em quiet: o modo auto-update nao imprime nada no stdout.
+  if [ "$QUIET" = "1" ]; then
+    return 0
+  fi
   printf '\n'
   printf '  %s%s{ cura }%s  biblioteca 9.0\n' "$C_BOLD" "$C_VERDE" "$C_RESET"
   printf '  %sinstalador mac%s\n' "$C_BOLD" "$C_RESET"
@@ -701,12 +723,80 @@ cleanup_plugins_dir() {
 }
 
 # ---------------------------------------------------------------------------
+# LaunchAgent de auto-update (dispara no login + reserva diaria)
+# ---------------------------------------------------------------------------
+register_updater() {
+  # nunca em quiet: o proprio updater roda em quiet e nao deve se re-registrar
+  # a cada disparo automatico. so instalacao interativa registra.
+  if [ "$QUIET" = "1" ]; then
+    return 0
+  fi
+
+  mkdir -p "$LAUNCH_AGENTS_DIR"
+
+  # o updater SEMPRE puxa da release oficial: DEFAULT_BASE_URL literal, nunca
+  # $BASE_URL (um teste local sobrescreve via CURA_BASE_URL). o pipeline
+  # "curl ... | bash -s -- --quiet" fica literal no plist e e avaliado pelo bash
+  # do launchd em runtime — o auto-update sempre baixa a versao vigente. (forma
+  # pipe, nao "$(curl ...)": bash -c avaliando "$(...)" literal trataria a 1a
+  # palavra do script como comando, nao rodaria o script.)
+  cat > "$UPDATER_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$UPDATER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>curl -fsSL $DEFAULT_BASE_URL/install.sh | /bin/bash -s -- --quiet</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>86400</integer>
+  <key>StandardOutPath</key>
+  <string>$CURA_STATE_DIR/updater.out</string>
+  <key>StandardErrorPath</key>
+  <string>$CURA_STATE_DIR/updater.err</string>
+</dict>
+</plist>
+PLISTEOF
+
+  log "auto-update registrado (login + diária)"
+
+  # em teste (CURA_BASE_URL setado) o plist ja foi escrito num HOME isolado; nao
+  # mexemos no launchd real da maquina — so pulamos o load/unload.
+  if [ -n "${CURA_BASE_URL:-}" ]; then
+    log "modo teste: launchctl load/unload pulado"
+    return 0
+  fi
+
+  # ativa sem exigir novo login: unload silencioso (pode nao estar carregado)
+  # seguido de load. if protege o set -e de retorno nao-zero legitimo.
+  if launchctl unload "$UPDATER_PLIST" >/dev/null 2>&1; then :; fi
+  if launchctl load "$UPDATER_PLIST" >/dev/null 2>&1; then :; fi
+}
+
+# ---------------------------------------------------------------------------
 # Instalacao
 # ---------------------------------------------------------------------------
 do_install() {
   log_header
   banner
-  wait_sketchup_closed
+  if [ "$QUIET" = "1" ]; then
+    # em quiet nao ha terminal pra pedir pra fechar o SketchUp; e trocar
+    # arquivos embaixo do programa rodando corromperia a sessao. se estiver
+    # aberto, adia — o proximo gatilho (login/diaria) tenta de novo.
+    if pgrep -x "SketchUp" >/dev/null 2>&1; then
+      log "quiet: SketchUp aberto, adiando update"
+      exit 0
+    fi
+  else
+    wait_sketchup_closed
+  fi
 
   detect_python3
   write_helper_scripts
@@ -733,6 +823,43 @@ do_install() {
       VERSION_DIRS+=("$plugins_dir")
     fi
   done
+
+  # no-op short-circuit (antes de baixar qualquer payload): nada mudou desde a
+  # ultima instalacao? entao nao re-extrai — evita trabalho a cada disparo do
+  # auto-update. exige: (1) mesma versao da biblioteca no snapshot, (2) todo
+  # item registrado ainda no disco e (3) toda versao do SketchUp detectada AGORA
+  # ja coberta pelo snapshot — assim uma instalacao "so fontes" que depois ganha
+  # um SketchUp novo NAO vira no-op e os plugins entram. qualquer teste que
+  # falhe (path faltando, versao diferente, SketchUp novo) segue instalacao
+  # normal.
+  if [ -f "$SNAPSHOT_PATH" ]; then
+    read_snapshot
+    if [ -n "$BIBLIOTECA_VERSION" ] && [ "$SNAP_BIBLIOTECA_VERSION" = "$BIBLIOTECA_VERSION" ] && [ "${#SNAP_ITEM_PATHS[@]}" -gt 0 ]; then
+      local noop=1 snap_path plugins_dir_c covered sp
+      for snap_path in "${SNAP_ITEM_PATHS[@]}"; do
+        [ -e "$snap_path" ] || { noop=0; break; }
+      done
+      if [ "$noop" = "1" ] && [ "${#VERSION_DIRS[@]}" -gt 0 ]; then
+        for plugins_dir_c in "${VERSION_DIRS[@]}"; do
+          covered=0
+          for sp in "${SNAP_ITEM_PATHS[@]}"; do
+            case "$sp" in
+              "$plugins_dir_c"/*) covered=1; break ;;
+            esac
+          done
+          [ "$covered" = "1" ] || { noop=0; break; }
+        done
+      fi
+      if [ "$noop" = "1" ]; then
+        log "no-op: biblioteca ja na versao $BIBLIOTECA_VERSION"
+        # silencioso em quiet; em modo normal, uma linha curta.
+        if [ "$QUIET" != "1" ]; then
+          say "biblioteca já está atualizada (v$BIBLIOTECA_VERSION). nada a fazer."
+        fi
+        exit 0
+      fi
+    fi
+  fi
 
   local HAD_ERROR=0
 
@@ -822,14 +949,20 @@ do_install() {
 
   write_snapshot
 
-  # resumo final
-  printf '\n%s\n' "$SEPARADOR"
+  # resumo final (sem separador no stdout em quiet)
+  if [ "$QUIET" != "1" ]; then
+    printf '\n%s\n' "$SEPARADOR"
+  fi
   if [ "${#VERSION_YEARS[@]}" -eq 0 ]; then
     if [ "$FONTS_INSTALLED_COUNT" -gt 0 ]; then
       say "fontes instaladas: $FONTS_INSTALLED_COUNT. log: $LOG_PATH."
     else
       say "log: $LOG_PATH."
     fi
+    # registra o auto-update mesmo no caminho "so fontes": e justo aqui que ele
+    # importa — quando o SketchUp aparecer depois, o gatilho instala os plugins
+    # (o no-op acima nao dispara nesse caso). register_updater e no-op em quiet.
+    register_updater
     exit 1
   fi
 
@@ -876,8 +1009,13 @@ do_install() {
     exit 2
   fi
 
-  printf '%sok /%s %s\n' "$C_BOLD" "$C_RESET" "$msg"
+  if [ "$QUIET" != "1" ]; then
+    printf '%sok /%s %s\n' "$C_BOLD" "$C_RESET" "$msg"
+  fi
   log "resumo: ok / $msg"
+  # instalacao interativa bem-sucedida: registra o auto-update (login + diaria).
+  # no-op em quiet.
+  register_updater
   exit 0
 }
 
@@ -937,6 +1075,17 @@ do_uninstall() {
       log "aviso: caminho fora do escopo permitido, ignorado na desinstalação: $path"
     fi
   done
+
+  # desregistra o auto-update junto: unload silencioso + remove o plist, antes
+  # de apagar o snapshot. em teste (CURA_BASE_URL) pula o launchctl real mas
+  # ainda remove o plist do HOME isolado.
+  if [ -z "${CURA_BASE_URL:-}" ]; then
+    if launchctl unload "$UPDATER_PLIST" >/dev/null 2>&1; then :; fi
+  fi
+  if [ -e "$UPDATER_PLIST" ]; then
+    rm -f "$UPDATER_PLIST"
+    log "auto-update desregistrado"
+  fi
 
   rm -f "$SNAPSHOT_PATH"
   printf '%sok /%s biblioteca cura desinstalada. log: %s\n' "$C_BOLD" "$C_RESET" "$LOG_PATH"

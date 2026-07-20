@@ -25,8 +25,18 @@
 param(
     [switch]$Uninstall,
     [switch]$Force,
+    # -Quiet: modo não-interativo usado pelo auto-update agendado. Sem prompts,
+    # sem esperar o SketchUp fechar (adia se estiver aberto), no-op quando já
+    # está na versão do manifest.
+    [switch]$Quiet,
     [string]$BaseUrl = $(if ($env:CURA_BASE_URL) { $env:CURA_BASE_URL } else { "https://github.com/joaotegoni/cura-biblioteca/releases/latest/download" })
 )
+
+# URL FIXA da release oficial — usada só pelo registro do auto-update. Nunca
+# usa $BaseUrl aqui: o updater tem que puxar sempre da release de verdade,
+# mesmo que esta execução esteja com CURA_BASE_URL apontando pasta de teste.
+$script:OfficialBaseUrl = "https://github.com/joaotegoni/cura-biblioteca/releases/latest/download"
+$script:UpdaterTaskName = "CURA Biblioteca Updater"
 
 # --- TLS 1.2 + encoding do console (tem que vir antes de qualquer output) ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -238,6 +248,101 @@ function Get-CuraOldSnapshot {
     return $null
 }
 
+function Test-CuraUpToDate {
+    # Decide se dá pra pular a instalação inteira (no-op). Só quando NADA mudou:
+    # mesma biblioteca_version no snapshot, toda versão do SketchUp detectada já
+    # está no snapshot com seus arquivos no lugar, e todas as fontes no lugar.
+    # Se surgiu um SketchUp novo (não presente no snapshot), NÃO é no-op — tem
+    # que instalar os plugins nele.
+    param(
+        [Parameter(Mandatory = $true)]$Manifest,
+        $OldSnapshot,
+        $DetectedVersions
+    )
+    if ($null -eq $OldSnapshot) { return $false }
+    if ($OldSnapshot.biblioteca_version -ne $Manifest.biblioteca_version) { return $false }
+
+    foreach ($ver in $DetectedVersions) {
+        $snapVer = $null
+        foreach ($sv in $OldSnapshot.sketchup_versions) {
+            if ($sv.year -eq $ver.Year) { $snapVer = $sv; break }
+        }
+        if ($null -eq $snapVer) { return $false }   # SketchUp novo -> precisa instalar
+        if (-not $snapVer.plugins -or @($snapVer.plugins).Count -eq 0) { return $false }
+        foreach ($p in $snapVer.plugins) {
+            foreach ($r in $p.roots) {
+                if (-not (Test-Path -LiteralPath (Join-Path $ver.PluginsPath $r))) { return $false }
+            }
+        }
+    }
+
+    foreach ($f in $OldSnapshot.fonts) {
+        if (-not (Test-Path -LiteralPath $f.file)) { return $false }
+    }
+    return $true
+}
+
+function Register-CuraUpdater {
+    # Registra a tarefa agendada per-user (sem admin) que roda o auto-update:
+    # no logon + diária de reserva. A ação baixa SEMPRE o install.ps1 mais
+    # recente da release oficial e roda -Quiet. Falha aqui é aviso, nunca erro
+    # fatal — a instalação principal já terminou com sucesso quando chegamos aqui.
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$OfficialBaseUrl,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+    try {
+        # comando interno: TLS 1.2, baixa o install.ps1 latest pro TEMP e roda
+        # -Quiet. Empacotado com -EncodedCommand (base64 UTF-16LE) pra não
+        # depender de escaping de aspas na linha de comando da tarefa agendada.
+        $inner = @"
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+`$u='$OfficialBaseUrl/install.ps1'
+`$o=Join-Path `$env:TEMP 'cura-updater.ps1'
+try { Invoke-WebRequest -Uri `$u -OutFile `$o -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop } catch { exit 0 }
+& `$o -Quiet
+"@
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+        $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $enc"
+
+        if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
+            $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
+            $trigLogon = New-ScheduledTaskTrigger -AtLogOn
+            $trigDaily = New-ScheduledTaskTrigger -Daily -At "12:00"
+            # roda como o usuário atual, privilégio limitado (sem admin), só quando logado.
+            $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+            $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigLogon, $trigDaily) `
+                -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+            Write-CuraLog -LogPath $LogPath -Message "auto-update registrado (logon + diária)"
+        } else {
+            # fallback Win7/PS3 sem o módulo ScheduledTasks: schtasks.exe (só logon).
+            $tr = "powershell.exe $psArgs"
+            & schtasks.exe /Create /TN $TaskName /TR $tr /SC ONLOGON /F 2>$null | Out-Null
+            Write-CuraLog -LogPath $LogPath -Message "auto-update registrado via schtasks (logon)"
+        }
+    } catch {
+        Write-CuraLog -LogPath $LogPath -Message "aviso: não foi possível registrar o auto-update: $($_.Exception.Message)"
+    }
+}
+
+function Unregister-CuraUpdater {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+    try {
+        if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        & schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
+        Write-CuraLog -LogPath $LogPath -Message "auto-update desregistrado"
+    } catch {
+        # tarefa pode nem existir — ignorar
+    }
+}
+
 function Invoke-CuraUninstall {
     param(
         [Parameter(Mandatory = $true)][string]$SnapshotPath,
@@ -285,6 +390,8 @@ function Invoke-CuraUninstall {
         Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts" -Name $f.reg_name -ErrorAction SilentlyContinue
     }
 
+    Unregister-CuraUpdater -TaskName $script:UpdaterTaskName -LogPath $LogPath
+
     Remove-Item -LiteralPath $SnapshotPath -Force -ErrorAction SilentlyContinue
     Write-CuraLog -LogPath $LogPath -Message "desinstalação concluída. snapshot removido."
     Write-Host ""
@@ -304,15 +411,25 @@ if ($Uninstall) {
 }
 
 try {
-    # --- 2. SketchUp aberto? pede pra fechar (não mata o processo) ---
-    while ($true) {
-        $procs = Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue
-        if (-not $procs) { break }
-        Write-Host "o SketchUp está aberto. feche o programa e pressione enter para continuar (ou digite 'sair' para cancelar)."
-        $resp = Read-Host
-        if ($resp -match '^(sair|exit|q)$') {
-            Write-CuraLog -LogPath $LogPath -Message "aviso: instalação cancelada pelo usuário (SketchUp aberto)."
-            exit 2
+    # --- 2. SketchUp aberto? ---
+    # Quiet (auto-update): não trocar arquivo embaixo do programa rodando. Se
+    # estiver aberto, adia pro próximo gatilho (exit 0, sem alarde).
+    # Interativo: pede pra fechar (não mata o processo).
+    if ($Quiet) {
+        if (Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue) {
+            Write-CuraLog -LogPath $LogPath -Message "quiet: SketchUp aberto, adiando update."
+            exit 0
+        }
+    } else {
+        while ($true) {
+            $procs = Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue
+            if (-not $procs) { break }
+            Write-Host "o SketchUp está aberto. feche o programa e pressione enter para continuar (ou digite 'sair' para cancelar)."
+            $resp = Read-Host
+            if ($resp -match '^(sair|exit|q)$') {
+                Write-CuraLog -LogPath $LogPath -Message "aviso: instalação cancelada pelo usuário (SketchUp aberto)."
+                exit 2
+            }
         }
     }
 
@@ -338,6 +455,19 @@ try {
         # --- 4/5. Detecta versões do SketchUp ---
         $versions = Get-CuraSketchUpVersions -MinVersion $manifest.min_sketchup
         $noSketchUpFound = ($versions.Count -eq 0)
+
+        # --- No-op: nada mudou desde a última instalação? pula tudo. Mantém o
+        # auto-update diário/logon barato e não fica re-extraindo plugin à toa
+        # (re-churn de arquivo reindexaria o SketchUp sem motivo). ---
+        if (Test-CuraUpToDate -Manifest $manifest -OldSnapshot $oldSnapshot -DetectedVersions $versions) {
+            Write-CuraLog -LogPath $LogPath -Message "no-op: biblioteca já na versão $($manifest.biblioteca_version)."
+            if (-not $Quiet) {
+                Write-Host ""
+                Write-Host "biblioteca já está atualizada (v$($manifest.biblioteca_version)). nada a fazer."
+                Write-Host "log: $LogPath"
+            }
+            exit 0
+        }
 
         $snapshotVersions = @()
 
@@ -468,6 +598,12 @@ try {
             fonts              = $installedFonts
         }
         $snapshot | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $SnapshotPath -Encoding UTF8
+
+        # --- 10. Auto-update: registra a tarefa agendada só na instalação
+        # interativa. O próprio updater roda -Quiet e não re-registra. ---
+        if (-not $Quiet) {
+            Register-CuraUpdater -TaskName $script:UpdaterTaskName -OfficialBaseUrl $script:OfficialBaseUrl -LogPath $LogPath
+        }
 
         # --- 11. Resumo final (voz cura: minúsculo, sem emoji, tag "ok /" só no
         # sucesso limpo - mesmo criterio do install.sh: 1 = só "sem SketchUp",
