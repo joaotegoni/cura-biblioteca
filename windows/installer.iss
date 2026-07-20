@@ -99,8 +99,8 @@ begin
     Result := (ResCode = 0);
 end;
 
-{ Roda o install.ps1 (cacheado em {app}) visivel - o aluno acompanha o
-  progresso no console - e devolve o exit code real do script (0/1/2). }
+{ Roda o install.ps1 cacheado na pasta do app, visivel - o aluno acompanha
+  o progresso no console - e devolve o exit code real do script (0/1/2). }
 function RunInstallScript(ScriptPath: String; var ResCode: Integer): Boolean;
 var
   Cmd: String;
