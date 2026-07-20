@@ -186,6 +186,33 @@ function Get-CuraAsset {
     return Get-CuraRemoteFile -Url $url -OutFile $OutFile -LogPath $LogPath
 }
 
+function Get-CuraPluginPayload {
+    # Baixa o payload de um plugin. Contrato do manifest (SPEC.md): url null
+    # -> BASE/<file> (via Get-CuraAsset); url absoluta -> usa ela direto
+    # (aceita também path local/file://, modo teste, espelhando
+    # Resolve-CuraLocalPath). O Mac já respeita isso; aqui equipara.
+    param(
+        [Parameter(Mandatory = $true)]$Plugin,
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+    if ($Plugin.url) {
+        $localPath = Resolve-CuraLocalPath -BaseUrl $Plugin.url
+        if ($null -ne $localPath) {
+            if (-not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+                Write-CuraLog -LogPath $LogPath -Message "erro / arquivo local não encontrado: $localPath" -IsError
+                return $false
+            }
+            Copy-Item -LiteralPath $localPath -Destination $OutFile -Force
+            Write-CuraLog -LogPath $LogPath -Message "copiado localmente (modo teste, url própria): $localPath"
+            return $true
+        }
+        return Get-CuraRemoteFile -Url $Plugin.url -OutFile $OutFile -LogPath $LogPath
+    }
+    return Get-CuraAsset -BaseUrl $BaseUrl -FileName $Plugin.file -OutFile $OutFile -LogPath $LogPath
+}
+
 function Get-CuraSketchUpVersions {
     # Detecta instalações do SketchUp em %APPDATA%\SketchUp\SketchUp 20XX e
     # devolve só as que atendem $MinVersion. Nunca lança erro se a pasta raiz
@@ -214,14 +241,31 @@ function Get-CuraSketchUpVersions {
     return $result
 }
 
+function Test-CuraSafeLeafName {
+    # Espelha is_safe_leaf_name do install.sh (SPEC.md linha ~133): rejeita
+    # nome vazio e qualquer nome contendo separador de path ("\" ou "/") ou
+    # "..". Guarda anti path-traversal aplicada a todo nome vindo do
+    # manifest/snapshot antes de virar alvo de remoção.
+    param([string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+    if ($Name -match '[\\/]' -or $Name -match '\.\.') { return $false }
+    return $true
+}
+
 function Remove-CuraExact {
     # Remove SÓ por nome exato (arquivo ou pasta) dentro de $ParentDir.
-    # Nunca usa wildcard/glob - literal match apenas.
+    # Nunca usa wildcard/glob - literal match apenas. Nome que falhar a
+    # guarda anti path-traversal é rejeitado (log de aviso + skip) antes de
+    # qualquer Join-Path.
     param(
         [Parameter(Mandatory = $true)][string]$ParentDir,
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$LogPath
     )
+    if (-not (Test-CuraSafeLeafName -Name $Name)) {
+        Write-CuraLog -LogPath $LogPath -Message "aviso: nome de remoção rejeitado (path-traversal?): '$Name' - ignorado."
+        return
+    }
     $target = Join-Path $ParentDir $Name
     if (Test-Path -LiteralPath $target) {
         try {
@@ -248,6 +292,36 @@ function Get-CuraOldSnapshot {
     return $null
 }
 
+function Wait-CuraSketchUpClosed {
+    # Verifica (e, se interativo, aguarda) que o SketchUp não está aberto.
+    # -Quiet: adia (exit 0), sem alarde, igual ao check inicial. Interativo:
+    # pede pra fechar e espera enter, com opção de cancelar. Chamada tanto no
+    # início do fluxo quanto de novo logo antes da 1ª remoção/Expand-Archive
+    # (o download dos payloads pode levar minutos e o SketchUp pode ter sido
+    # aberto nesse meio tempo).
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [switch]$Quiet
+    )
+    if ($Quiet) {
+        if (Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue) {
+            Write-CuraLog -LogPath $LogPath -Message "quiet: SketchUp aberto, adiando update."
+            exit 0
+        }
+    } else {
+        while ($true) {
+            $procs = Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue
+            if (-not $procs) { break }
+            Write-Host "o SketchUp está aberto. feche o programa e pressione enter para continuar (ou digite 'sair' para cancelar)."
+            $resp = Read-Host
+            if ($resp -match '^(sair|exit|q)$') {
+                Write-CuraLog -LogPath $LogPath -Message "aviso: instalação cancelada pelo usuário (SketchUp aberto)."
+                exit 2
+            }
+        }
+    }
+}
+
 function Test-CuraUpToDate {
     # Decide se dá pra pular a instalação inteira (no-op). Só quando NADA mudou:
     # mesma biblioteca_version no snapshot, toda versão do SketchUp detectada já
@@ -268,9 +342,15 @@ function Test-CuraUpToDate {
             if ($sv.year -eq $ver.Year) { $snapVer = $sv; break }
         }
         if ($null -eq $snapVer) { return $false }   # SketchUp novo -> precisa instalar
-        if (-not $snapVer.plugins -or @($snapVer.plugins).Count -eq 0) { return $false }
-        foreach ($p in $snapVer.plugins) {
-            foreach ($r in $p.roots) {
+
+        # Autoritativo contra o MANIFEST atual, não contra o que o snapshot
+        # registrou: todo root de todo plugin do manifest precisa existir de
+        # verdade no Plugins/ desta versão. Corrige o caso de uma rodada
+        # anterior ter falhado em instalar um plugin (sha256/download) - se o
+        # snapshot só tivesse os plugins que ela registrou, o no-op passaria
+        # mesmo faltando plugin em disco.
+        foreach ($plugin in $Manifest.plugins) {
+            foreach ($r in $plugin.roots) {
                 if (-not (Test-Path -LiteralPath (Join-Path $ver.PluginsPath $r))) { return $false }
             }
         }
@@ -296,12 +376,29 @@ function Register-CuraUpdater {
         # comando interno: TLS 1.2, baixa o install.ps1 latest pro TEMP e roda
         # -Quiet. Empacotado com -EncodedCommand (base64 UTF-16LE) pra não
         # depender de escaping de aspas na linha de comando da tarefa agendada.
+        # Roda o baixado como PROCESSO FILHO (não `&` direto): install.ps1
+        # termina com `exit`, que mataria este wrapper inteiro antes de
+        # conseguir copiar o script pro cache depois. Rodando como filho, o
+        # exit code vem por $LASTEXITCODE sem derrubar o wrapper. Se rodou
+        # até um dos exit codes esperados do próprio script (0/1/2 - ou seja,
+        # não foi um crash/parse error), copia o baixado por cima do cache em
+        # {localappdata}\CURA-Biblioteca\install.ps1 (se o dir existir), pra
+        # que o uninstall do Inno (que roda essa cópia congelada) também
+        # receba fixes futuros.
         $inner = @"
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 `$u='$OfficialBaseUrl/install.ps1'
 `$o=Join-Path `$env:TEMP 'cura-updater.ps1'
 try { Invoke-WebRequest -Uri `$u -OutFile `$o -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop } catch { exit 0 }
-& `$o -Quiet
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `$o -Quiet
+`$code = `$LASTEXITCODE
+if (`$code -eq 0 -or `$code -eq 1 -or `$code -eq 2) {
+    `$cache = Join-Path `$env:LOCALAPPDATA 'CURA-Biblioteca'
+    if (Test-Path -LiteralPath `$cache) {
+        Copy-Item -LiteralPath `$o -Destination (Join-Path `$cache 'install.ps1') -Force -ErrorAction SilentlyContinue
+    }
+}
+exit `$code
 "@
         $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
         $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $enc"
@@ -354,8 +451,16 @@ function Invoke-CuraUninstall {
         exit 0
     }
 
-    $raw  = Get-Content -LiteralPath $SnapshotPath -Raw -Encoding UTF8
-    $snap = $raw | ConvertFrom-Json
+    # Reaproveita Get-CuraOldSnapshot (já protegido com try/catch) em vez de
+    # ler/parsear cru aqui - snapshot corrompido não pode virar exceção não
+    # tratada no meio do -Uninstall.
+    $snap = Get-CuraOldSnapshot -SnapshotPath $SnapshotPath
+    if ($null -eq $snap) {
+        Write-CuraLog -LogPath $LogPath -Message "aviso: snapshot ilegível ou corrompido ($SnapshotPath) - nada a desinstalar."
+        Write-Host "não foi possível ler o registro desta instalação (arquivo corrompido)."
+        Write-Host "log: $LogPath"
+        exit 0
+    }
 
     Write-Host "itens que serão removidos:"
     foreach ($ver in $snap.sketchup_versions) {
@@ -375,14 +480,47 @@ function Invoke-CuraUninstall {
         }
     }
 
+    # Whitelist de prefixo no PARENTDIR: Remove-CuraExact já valida o Name
+    # (path-traversal), mas o plugins_path em si vem cru do snapshot - se
+    # estiver corrompido/adulterado apontando pra fora da árvore do
+    # SketchUp, nada deveria ser removido lá. Mesma ideia da whitelist de
+    # fontes logo abaixo.
+    $sketchUpRootUninstall = [System.IO.Path]::GetFullPath((Join-Path $env:APPDATA "SketchUp"))
     foreach ($ver in $snap.sketchup_versions) {
+        $pluginsPathSafe = $false
+        try {
+            $resolvedPluginsPath = [System.IO.Path]::GetFullPath($ver.plugins_path)
+            $pluginsPathSafe = $resolvedPluginsPath.StartsWith($sketchUpRootUninstall, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $pluginsPathSafe = $false
+        }
+        if (-not $pluginsPathSafe) {
+            Write-CuraLog -LogPath $LogPath -Message "aviso: plugins_path fora do diretório esperado, ignorado: $($ver.plugins_path)"
+            continue
+        }
         foreach ($p in $ver.plugins) {
             foreach ($r in $p.roots) {
                 Remove-CuraExact -ParentDir $ver.plugins_path -Name $r -LogPath $LogPath
             }
         }
     }
+    # Whitelist de prefixo (espelha is_allowed_removal_path do install.sh):
+    # só remove o arquivo de fonte do snapshot se ele está DENTRO do dir de
+    # fontes per-user esperado - nunca confia cegamente no path gravado.
+    $winFontsDirUninstall = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Fonts"
     foreach ($f in $snap.fonts) {
+        $fontInsideExpectedDir = $false
+        try {
+            $resolvedFont     = [System.IO.Path]::GetFullPath($f.file)
+            $resolvedFontsDir = [System.IO.Path]::GetFullPath($winFontsDirUninstall)
+            $fontInsideExpectedDir = $resolvedFont.StartsWith($resolvedFontsDir, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $fontInsideExpectedDir = $false
+        }
+        if (-not $fontInsideExpectedDir) {
+            Write-CuraLog -LogPath $LogPath -Message "aviso: caminho de fonte fora do diretório esperado, ignorado: $($f.file)"
+            continue
+        }
         if (Test-Path -LiteralPath $f.file) {
             Remove-Item -LiteralPath $f.file -Force -ErrorAction SilentlyContinue
             Write-CuraLog -LogPath $LogPath -Message "fonte removida: $($f.file)"
@@ -406,32 +544,40 @@ function Invoke-CuraUninstall {
 
 Write-CuraBanner -LogPath $LogPath
 
-if ($Uninstall) {
-    Invoke-CuraUninstall -SnapshotPath $SnapshotPath -LogPath $LogPath -Force:$Force
+# --- Lock de concorrência: mutex nomeado per-user. Evita dois processos
+# mexendo ao mesmo tempo em Plugins/ e installed.json - ex.: a Tarefa
+# Agendada dispara no logon/12h bem na hora em que o aluno roda o
+# Setup.exe de novo. WaitOne(0) não espera: se já tem dono, desiste na hora
+# em vez de travar (o próximo gatilho do updater tenta de novo sozinho).
+# Vale pro fluxo de instalação E pro -Uninstall - por isso é adquirido antes
+# do "if ($Uninstall)". Liberado no finally lá embaixo.
+$script:CuraMutex = New-Object System.Threading.Mutex($false, 'Local\CuraBibliotecaInstaller')
+$script:CuraMutexOwned = $false
+try {
+    $script:CuraMutexOwned = $script:CuraMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    # dono anterior encerrou sem liberar (crash) - ainda assim conseguimos o lock
+    $script:CuraMutexOwned = $true
+}
+if (-not $script:CuraMutexOwned) {
+    Write-CuraLog -LogPath $LogPath -Message "aviso: outra operação da biblioteca cura já está em andamento - encerrando."
+    if (-not $Quiet) {
+        Write-Host "outra operação da biblioteca cura já está em andamento. tente novamente em alguns instantes."
+    }
+    $script:CuraMutex.Dispose()
+    exit 0
 }
 
 try {
+    if ($Uninstall) {
+        Invoke-CuraUninstall -SnapshotPath $SnapshotPath -LogPath $LogPath -Force:$Force
+    }
+
     # --- 2. SketchUp aberto? ---
     # Quiet (auto-update): não trocar arquivo embaixo do programa rodando. Se
     # estiver aberto, adia pro próximo gatilho (exit 0, sem alarde).
     # Interativo: pede pra fechar (não mata o processo).
-    if ($Quiet) {
-        if (Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue) {
-            Write-CuraLog -LogPath $LogPath -Message "quiet: SketchUp aberto, adiando update."
-            exit 0
-        }
-    } else {
-        while ($true) {
-            $procs = Get-Process -Name "SketchUp*" -ErrorAction SilentlyContinue
-            if (-not $procs) { break }
-            Write-Host "o SketchUp está aberto. feche o programa e pressione enter para continuar (ou digite 'sair' para cancelar)."
-            $resp = Read-Host
-            if ($resp -match '^(sair|exit|q)$') {
-                Write-CuraLog -LogPath $LogPath -Message "aviso: instalação cancelada pelo usuário (SketchUp aberto)."
-                exit 2
-            }
-        }
-    }
+    Wait-CuraSketchUpClosed -LogPath $LogPath -Quiet:$Quiet
 
     $TempDir = Join-Path $env:TEMP ("cura-biblioteca-" + [System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
@@ -453,7 +599,10 @@ try {
         $hadErrors = $false
 
         # --- 4/5. Detecta versões do SketchUp ---
-        $versions = Get-CuraSketchUpVersions -MinVersion $manifest.min_sketchup
+        # @() força array mesmo quando exatamente 1 versão é detectada (o
+        # PowerShell 5.1 "desembrulha" coleção de 1 elemento no retorno de
+        # função, o que quebraria .Count mais abaixo).
+        $versions = @(Get-CuraSketchUpVersions -MinVersion $manifest.min_sketchup)
         $noSketchUpFound = ($versions.Count -eq 0)
 
         # --- No-op: nada mudou desde a última instalação? pula tudo. Mantém o
@@ -461,6 +610,13 @@ try {
         # (re-churn de arquivo reindexaria o SketchUp sem motivo). ---
         if (Test-CuraUpToDate -Manifest $manifest -OldSnapshot $oldSnapshot -DetectedVersions $versions) {
             Write-CuraLog -LogPath $LogPath -Message "no-op: biblioteca já na versão $($manifest.biblioteca_version)."
+            # self-cura: garante que a tarefa agendada existe/está com a
+            # definição mais recente mesmo quando não há nada pra
+            # (re)instalar - interativo OU -Quiet (idempotente via
+            # Register-ScheduledTask -Force). Sem isso, o wrapper do updater
+            # nunca se atualiza sozinho: a tarefa roda sempre -Quiet, então
+            # só o ramo -not $Quiet nunca bastava.
+            Register-CuraUpdater -TaskName $script:UpdaterTaskName -OfficialBaseUrl $script:OfficialBaseUrl -LogPath $LogPath
             if (-not $Quiet) {
                 Write-Host ""
                 Write-Host "biblioteca já está atualizada (v$($manifest.biblioteca_version)). nada a fazer."
@@ -478,7 +634,7 @@ try {
             $verifiedPlugins = @()
             foreach ($plugin in $manifest.plugins) {
                 $destFile = Join-Path $TempDir $plugin.file
-                $ok = Get-CuraAsset -BaseUrl $BaseUrl -FileName $plugin.file -OutFile $destFile -LogPath $LogPath
+                $ok = Get-CuraPluginPayload -Plugin $plugin -BaseUrl $BaseUrl -OutFile $destFile -LogPath $LogPath
                 if (-not $ok) {
                     Write-CuraLog -LogPath $LogPath -Message "erro / falha ao baixar $($plugin.name) ($($plugin.file)). este item não será instalado." -IsError
                     $hadErrors = $true
@@ -497,36 +653,49 @@ try {
                 Write-CuraLog -LogPath $LogPath -Message "payload verificado: $($plugin.name) v$($plugin.version) (sha256 ok)"
             }
 
+            # --- 6. Re-checa SketchUp antes da 1ª remoção/Expand-Archive: o
+            # download+verificação acima pode ter levado minutos, e o
+            # processo pode ter sido aberto nesse meio tempo. ---
+            Wait-CuraSketchUpClosed -LogPath $LogPath -Quiet:$Quiet
+
             # --- 6/7b. Por versão: limpeza (remove list + roots antigos/atuais) e instalação ---
             foreach ($ver in $versions) {
                 if (-not (Test-Path -LiteralPath $ver.PluginsPath)) {
                     New-Item -ItemType Directory -Path $ver.PluginsPath -Force | Out-Null
                 }
 
+                # Lista `remove` (plugins mortos) é incondicional - independe
+                # de $verifiedPlugins.
                 foreach ($name in $manifest.remove) {
-                    Remove-CuraExact -ParentDir $ver.PluginsPath -Name $name -LogPath $LogPath
-                }
-
-                $rootsToClean = @()
-                if (($null -ne $oldSnapshot) -and ($null -ne $oldSnapshot.sketchup_versions)) {
-                    foreach ($oldVer in $oldSnapshot.sketchup_versions) {
-                        if ($oldVer.year -eq $ver.Year) {
-                            foreach ($p in $oldVer.plugins) {
-                                foreach ($r in $p.roots) { $rootsToClean += $r }
-                            }
-                        }
-                    }
-                }
-                foreach ($plugin in $manifest.plugins) {
-                    foreach ($r in $plugin.roots) { $rootsToClean += $r }
-                }
-                $rootsToClean = $rootsToClean | Select-Object -Unique
-                foreach ($name in $rootsToClean) {
                     Remove-CuraExact -ParentDir $ver.PluginsPath -Name $name -LogPath $LogPath
                 }
 
                 $installedPluginsForVersion = @()
                 foreach ($vp in $verifiedPlugins) {
+                    # Só limpa os roots (snapshot antigo + manifest atual)
+                    # DESTE plugin, e só porque ele passou na verificação de
+                    # sha256 - imediatamente antes do Expand-Archive dele.
+                    # Plugin que falhou a verificação nunca chega aqui (não
+                    # está em $verifiedPlugins) e mantém a cópia antiga
+                    # intacta no disco.
+                    $pluginRootsToClean = @()
+                    if (($null -ne $oldSnapshot) -and ($null -ne $oldSnapshot.sketchup_versions)) {
+                        foreach ($oldVer in $oldSnapshot.sketchup_versions) {
+                            if ($oldVer.year -eq $ver.Year) {
+                                foreach ($p in $oldVer.plugins) {
+                                    if ($p.id -eq $vp.Plugin.id) {
+                                        foreach ($r in $p.roots) { $pluginRootsToClean += $r }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    foreach ($r in $vp.Plugin.roots) { $pluginRootsToClean += $r }
+                    $pluginRootsToClean = $pluginRootsToClean | Select-Object -Unique
+                    foreach ($name in $pluginRootsToClean) {
+                        Remove-CuraExact -ParentDir $ver.PluginsPath -Name $name -LogPath $LogPath
+                    }
+
                     try {
                         Expand-Archive -LiteralPath $vp.ZipPath -DestinationPath $ver.PluginsPath -Force
                         Write-CuraLog -LogPath $LogPath -Message "instalado $($vp.Plugin.name) v$($vp.Plugin.version) em SketchUp $($ver.Year)"
@@ -591,19 +760,42 @@ try {
         }
 
         # --- 9. Snapshot (para desinstalação futura) ---
+        # Se algum item falhou (sha256/download/extração), grava a
+        # biblioteca_version ANTIGA em vez da nova - senão a próxima rodada
+        # do updater vê a version nova já batendo no snapshot e cai no no-op
+        # (Test-CuraUpToDate), nunca mais retentando o item que faltou. Os
+        # itens que instalaram com sucesso já ficam registrados normalmente
+        # em $snapshotVersions/$installedFonts.
+        $snapshotBibliotecaVersion = $manifest.biblioteca_version
+        if ($hadErrors) {
+            if ($null -ne $oldSnapshot) {
+                $snapshotBibliotecaVersion = $oldSnapshot.biblioteca_version
+            } else {
+                $snapshotBibliotecaVersion = ""
+            }
+        }
         $snapshot = [PSCustomObject]@{
-            biblioteca_version = $manifest.biblioteca_version
+            biblioteca_version = $snapshotBibliotecaVersion
             installed_at       = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
             sketchup_versions  = $snapshotVersions
             fonts              = $installedFonts
         }
-        $snapshot | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $SnapshotPath -Encoding UTF8
+        # Escrita atômica: grava num .tmp e só substitui o snapshot real com
+        # Move-Item -Force por cima - evita installed.json meio escrito se o
+        # processo for interrompido no meio do Set-Content (queda de energia,
+        # kill da tarefa por timeout, etc).
+        $snapshotTmpPath = "$SnapshotPath.tmp"
+        $snapshot | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $snapshotTmpPath -Encoding UTF8
+        Move-Item -LiteralPath $snapshotTmpPath -Destination $SnapshotPath -Force
 
-        # --- 10. Auto-update: registra a tarefa agendada só na instalação
-        # interativa. O próprio updater roda -Quiet e não re-registra. ---
-        if (-not $Quiet) {
-            Register-CuraUpdater -TaskName $script:UpdaterTaskName -OfficialBaseUrl $script:OfficialBaseUrl -LogPath $LogPath
-        }
+        # --- 10. Auto-update: (re)registra a tarefa agendada sempre que uma
+        # rodada chega até aqui - interativa OU -Quiet. Register-ScheduledTask
+        # -Force é idempotente e atualiza a DEFINIÇÃO da tarefa (a instância
+        # que está rodando agora, se for essa mesma tarefa, segue até o fim
+        # normalmente); assim uma mudança futura no wrapper do updater
+        # (Register-CuraUpdater) se propaga sozinha pro parque instalado, sem
+        # depender de reinstalação manual.
+        Register-CuraUpdater -TaskName $script:UpdaterTaskName -OfficialBaseUrl $script:OfficialBaseUrl -LogPath $LogPath
 
         # --- 11. Resumo final (voz cura: minúsculo, sem emoji, tag "ok /" só no
         # sucesso limpo - mesmo criterio do install.sh: 1 = só "sem SketchUp",
@@ -649,4 +841,10 @@ try {
     Write-Host ""
     Write-Host "log completo em: $LogPath"
     exit 2
+} finally {
+    if ($script:CuraMutexOwned) {
+        $script:CuraMutex.ReleaseMutex()
+    }
+    $script:CuraMutex.Dispose()
 }
+# cura-eof

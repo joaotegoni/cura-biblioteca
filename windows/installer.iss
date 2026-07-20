@@ -1,11 +1,13 @@
 ﻿; installer.iss — Biblioteca CURA (instalador Windows, Inno Setup 6)
 ;
 ; Bootstrapper fino: so embute scripts/install.ps1 como fallback offline.
-; No pos-instalacao, tenta baixar a versao mais recente do install.ps1
-; (BASE/install.ps1) e sobrescreve o embutido; se falhar, segue com o
-; embutido mesmo. Executa o script (visivel) e traduz o exit code dele
-; (0/1/2) pra mensagem final. O [UninstallRun] chama o mesmo script cacheado
-; com -Uninstall -Force (funciona offline).
+; No pos-instalacao, tenta baixar a versao mais recente do install.ps1 pra um
+; arquivo separado (BASE/install.ps1) e SO promove por cima do embutido se o
+; download deu certo e o arquivo parece valido (tamanho minimo); se falhar,
+; segue com o embutido mesmo. Executa o script (visivel) e traduz o exit code
+; dele (0/1/2) pra mensagem final. No uninstall, CurUninstallStepChanged roda
+; o mesmo script cacheado com -Uninstall -Force (funciona offline), guarda o
+; exit code e salva uma copia do log fora de {app} antes do [UninstallDelete].
 ;
 ; AppId gerado 1x via `uuidgen` — nunca trocar depois do primeiro release
 ; publico (trocar quebra upgrade/uninstall de quem ja instalou).
@@ -62,12 +64,12 @@ Source: "..\scripts\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 [Run]
 Filename: "{sys}\notepad.exe"; Parameters: """{app}\install.log"""; Description: "abrir o log da instalação"; Flags: postinstall shellexec skipifdoesntexist unchecked
 
-[UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -Uninstall -Force"; Flags: waituntilterminated runhidden
-
-; O ps1 -Uninstall so mexe no que esta no SNAPSHOT dele (plugins/fontes).
-; Aqui o Inno limpa a PROPRIA pasta de cache (ps1 cacheado + log + snapshot
-; residual), depois que o -Uninstall acima ja terminou de rodar.
+; [UninstallRun] foi removido: o Inno nao expoe o exit code de uma entrada
+; dessa secao pro [Code], entao rodar o script direto por Exec() dentro de
+; CurUninstallStepChanged(usUninstall) e a unica forma de capturar o
+; resultado real do -Uninstall (ver [Code] abaixo). O ps1 -Uninstall so mexe
+; no que esta no SNAPSHOT dele (plugins/fontes); aqui o Inno limpa a PROPRIA
+; pasta de cache (ps1 cacheado + log + snapshot residual) depois.
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
 
@@ -109,18 +111,53 @@ begin
   Result := Exec('powershell.exe', Cmd, '', SW_SHOWNORMAL, ewWaitUntilTerminated, ResCode);
 end;
 
+{ Roda o install.ps1 -Uninstall -Force, oculto (mesmo comportamento do antigo
+  [UninstallRun]) - devolve o exit code real do script. }
+function RunUninstallScript(ScriptPath: String; var ResCode: Integer): Boolean;
+var
+  Cmd: String;
+begin
+  Cmd := '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" -Uninstall -Force';
+  Result := Exec('powershell.exe', Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResCode);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ScriptPath: String;
+  DownloadPath: String;
   RunOk: Boolean;
   NotepadResCode: Integer;
+  DownloadOk: Boolean;
+  DownloadSize: Longint;
+  DownloadContent: AnsiString;
+  DownloadComplete: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
     ScriptPath := ExpandConstant('{app}') + '\install.ps1';
+    DownloadPath := ScriptPath + '.download';
     LogPathCura := ExpandConstant('{localappdata}') + '\CURA-Biblioteca\install.log';
 
-    DownloadLatestInstallScript(ScriptPath);
+    { Baixa pra um arquivo separado - nunca escreve por cima do embutido
+      direto. So promove (sobrescreve o embutido) se a funcao retornou True,
+      o arquivo existe, tem tamanho plausivel (> 1000 bytes, cinto extra) E
+      termina com o marcador "cura-eof" (ultima linha do install.ps1) - um
+      limiar de bytes sozinho nao pega truncamento no MEIO do arquivo, so no
+      fim; o marcador pega qualquer truncamento em qualquer ponto porque so
+      aparece na ultima linha do script. Senao apaga o .download e segue com
+      o embutido que o [Files] ja copiou. }
+    DownloadOk := DownloadLatestInstallScript(DownloadPath);
+    DownloadSize := 0;
+    DownloadComplete := False;
+    if DownloadOk and FileExists(DownloadPath) and FileSize(DownloadPath, DownloadSize) and (DownloadSize > 1000) then
+    begin
+      if LoadStringFromFile(DownloadPath, DownloadContent) then
+        DownloadComplete := (Pos('cura-eof', String(DownloadContent)) > 0);
+    end;
+    if DownloadComplete then
+      FileCopy(DownloadPath, ScriptPath, False);
+    if FileExists(DownloadPath) then
+      DeleteFile(DownloadPath);
 
     RunOk := RunInstallScript(ScriptPath, ResultCodeCura);
     if not RunOk then
@@ -132,6 +169,41 @@ begin
         mbError, MB_OK);
       Exec('notepad.exe', '"' + LogPathCura + '"', '', SW_SHOWNORMAL, ewNoWait, NotepadResCode);
     end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ScriptPath: String;
+  LogSrc: String;
+  LogDst: String;
+  RunOk: Boolean;
+  ResCode: Integer;
+begin
+  { usUninstall ocorre depois do prompt de confirmacao mas ANTES de qualquer
+    arquivo ser removido (inclusive antes do [UninstallDelete]) - da pra
+    rodar o script e salvar uma copia do log fora da pasta do app com
+    seguranca. }
+  if CurUninstallStep = usUninstall then
+  begin
+    ScriptPath := ExpandConstant('{app}') + '\install.ps1';
+    LogSrc := ExpandConstant('{localappdata}') + '\CURA-Biblioteca\install.log';
+    LogDst := ExpandConstant('{%TEMP}') + '\cura-uninstall.log';
+
+    RunOk := RunUninstallScript(ScriptPath, ResCode);
+    if not RunOk then
+      ResCode := 2;
+
+    { copia o log pra fora da pasta do app antes do [UninstallDelete] apagar
+      tudo - evidencia sobrevive mesmo se a desinstalacao falhar. }
+    if FileExists(LogSrc) then
+      FileCopy(LogSrc, LogDst, False);
+
+    { UninstallSilent (/SILENT ou /VERYSILENT): nao mostra o MsgBox - senao
+      um uninstall silencioso trava pra sempre num dialogo que ninguem ve. }
+    if (ResCode <> 0) and (not UninstallSilent) then
+      MsgBox('a desinstalação encontrou um problema (código ' + IntToStr(ResCode) + ').' + #13#10 + #13#10 +
+        'log salvo em: ' + LogDst, mbError, MB_OK);
   end;
 end;
 

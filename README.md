@@ -20,7 +20,7 @@ A biblioteca cura reúne os plugins e fontes do método cura para SketchUp. Este
 Abra o Terminal e cole a linha abaixo:
 
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joaotegoni/cura-biblioteca/main/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://github.com/joaotegoni/cura-biblioteca/releases/latest/download/install.sh)"
 ```
 
 O script baixa o manifest mais recente e instala os plugins e fontes em todas as versões do SketchUp encontradas no seu Mac.
@@ -32,7 +32,7 @@ O script baixa o manifest mais recente e instala os plugins e fontes em todas as
 **Mac:** cole a mesma linha do Terminal usada na instalação, acrescentando `-- --uninstall` no final:
 
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/joaotegoni/cura-biblioteca/main/scripts/install.sh)" -- --uninstall
+/bin/bash -c "$(curl -fsSL https://github.com/joaotegoni/cura-biblioteca/releases/latest/download/install.sh)" -- --uninstall
 ```
 
 Os dois modos listam exatamente o que vão remover antes de agir.

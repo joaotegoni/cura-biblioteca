@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,26 @@ def update_entry(entry: dict, *, label: str) -> tuple[str, str, str] | None:
     return (label, old_hash, new_hash)
 
 
+def validate_roots(entry: dict, payload_path: Path, *, label: str) -> None:
+    """Confere que 'roots' do manifest bate com as entradas de topo reais
+    dentro do .rbz/.zip (primeiro segmento de cada nome, deduplicado).
+
+    'roots' é o que cleanup/uninstall usam pra achar o que remover no disco
+    (SPEC.md: "roots = entradas raiz que o .rbz cria em Plugins/"); nada mais
+    no pipeline confere isso contra o conteudo real do zip. Divergiu -> erro
+    fatal (SystemExit 1), mesmo criterio de payload ausente acima — melhor
+    quebrar o CI do que deixar 'roots' desatualizado ir pra producao calado.
+    """
+    declared = set(entry.get("roots") or [])
+    with zipfile.ZipFile(payload_path) as zf:
+        actual = {name.split("/", 1)[0] for name in zf.namelist() if name.split("/", 1)[0]}
+    if declared != actual:
+        print(f"ERRO: 'roots' de {label} não bate com o conteúdo do zip.", file=sys.stderr)
+        print(f"  roots do manifest: {sorted(declared)}", file=sys.stderr)
+        print(f"  entradas de topo no zip: {sorted(actual)}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main() -> int:
     if not MANIFEST_PATH.is_file():
         print(f"ERRO: manifest nao encontrado em {MANIFEST_PATH}", file=sys.stderr)
@@ -76,6 +97,7 @@ def main() -> int:
         result = update_entry(plugin, label=label)
         if result:
             changes.append(result)
+            validate_roots(plugin, PAYLOAD_DIR / plugin["file"], label=label)
 
     fonts = manifest.get("fonts")
     if fonts is not None:

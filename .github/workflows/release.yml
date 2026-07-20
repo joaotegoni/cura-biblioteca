@@ -81,6 +81,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: false
+          # tags com sufixo (ex: v9.1.0-rc1, v9.1.0-beta) viram prerelease e
+          # nunca /releases/latest/download - só release cheia (vX.Y.Z) vira
+          # "latest" e é puxada pelo auto-update do parque inteiro.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             windows/Output/BibliotecaCURA-Setup.exe
             payload/cura-ferramentas.rbz

@@ -15,7 +15,9 @@
 #                   do GitHub.
 #
 # Exit codes: 0 = ok; 1 = parcial (SketchUp nao encontrado); 2 = falha.
-set -euo pipefail
+# -E (errtrace): sem isso o trap ERR abaixo NAO dispara dentro de funcoes —
+# e onde quase tudo de arriscado (cp/mkdir/unzip) realmente roda.
+set -Eeuo pipefail
 
 # ---------------------------------------------------------------------------
 # Config
@@ -29,6 +31,11 @@ CURA_STATE_DIR="$APP_SUPPORT_DIR/CURA-Biblioteca"
 SNAPSHOT_PATH="$CURA_STATE_DIR/installed.json"
 LOG_PATH="$CURA_STATE_DIR/install.log"
 FONTS_DIR="$HOME/Library/Fonts"
+
+# lock de concorrencia (launchagent de auto-update x execucao manual sobre o
+# mesmo installed.json/Plugins) — ver acquire_lock/release via cleanup().
+LOCK_DIR="$CURA_STATE_DIR/.lock"
+LOCK_HELD=0
 
 # launchagent de auto-update (registrado so em instalacao interativa — ver
 # register_updater). caminho fica sob $HOME, entao testes com HOME isolado nao
@@ -79,6 +86,11 @@ US=$'\x1f'
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cura-biblioteca.XXXXXX")"
 cleanup() {
   rm -rf "$TMP_DIR"
+  # so libera o lock se ESTE processo foi quem tomou (nunca mexe num lock de
+  # outra execucao so porque o dir existe).
+  if [ "$LOCK_HELD" = "1" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -112,6 +124,13 @@ err() {
   printf '%s%s%s\n' "$C_ERRO" "$1" "$C_RESET" >&2
   log "erro: $1"
 }
+
+# catch-all pra falhas inesperadas (disco cheio, permissao negada, etc) que
+# set -e aborta sem passar pelos caminhos de erro ja tratados — evita
+# traceback cru do sistema sem explicacao e sem apontar pro log. nao muda os
+# exit codes documentados (0/1/2): esses caminhos usam "exit N" explicito, que
+# nao dispara ERR. so falhas de comando realmente inesperadas caem aqui.
+trap 'err "erro inesperado. log: $LOG_PATH."; exit 2' ERR
 
 banner() {
   # sem banner em quiet: o modo auto-update nao imprime nada no stdout.
@@ -184,6 +203,19 @@ run_with_timeout() {
 PYTHON3_BIN=""
 detect_python3() {
   if command -v python3 >/dev/null 2>&1; then
+    local resolved
+    resolved="$(command -v python3)"
+    # /usr/bin/python3 e o stub do Xcode Command Line Tools: sem CLT
+    # instalado, so CHAMAR esse binario (mesmo pra --version) dispara um
+    # popup grafico do sistema pedindo pra instalar o CLT — sem relacao
+    # visivel com a biblioteca cura, confunde o aluno nao-tecnico. xcode-
+    # select -p retorna rapido e sem popup quando o CLT esta ausente, entao
+    # usamos ele pra decidir se e seguro invocar o stub. (parser awk de
+    # fallback cobre tudo que o parser python cobre — ver parse_manifest/
+    # write_snapshot/read_snapshot, todos com branch awk equivalente.)
+    if [ "$resolved" = "/usr/bin/python3" ] && ! xcode-select -p >/dev/null 2>&1; then
+      return 0
+    fi
     if run_with_timeout 5 python3 --version >/dev/null 2>&1; then
       PYTHON3_BIN="python3"
     fi
@@ -553,7 +585,6 @@ PLUGIN_IDS=(); PLUGIN_NAMES=(); PLUGIN_VERSIONS=(); PLUGIN_FILES=()
 PLUGIN_URLS=(); PLUGIN_SHA256S=(); PLUGIN_ROOTS_CSV=()
 FONTS_FILE=""; FONTS_SHA256=""
 REMOVE_NAMES=()
-ALL_PLUGIN_ROOTS=()
 
 parse_manifest() {
   local manifest_path="$1"
@@ -595,18 +626,6 @@ parse_manifest() {
         ;;
     esac
   done < "$tsv"
-
-  # uniao de todos os roots (usada na limpeza pre-instalacao/upgrade)
-  local i csv old_ifs name
-  for i in "${!PLUGIN_ROOTS_CSV[@]}"; do
-    csv="${PLUGIN_ROOTS_CSV[$i]}"
-    old_ifs="$IFS"
-    IFS=','
-    for name in $csv; do
-      ALL_PLUGIN_ROOTS+=("$name")
-    done
-    IFS="$old_ifs"
-  done
 }
 
 # ---------------------------------------------------------------------------
@@ -628,20 +647,28 @@ write_snapshot() {
     fi
   } > "$tsv"
 
+  # escrita atomica: grava em .tmp e so troca pelo destino final no mv — uma
+  # escrita interrompida (disco cheio, processo morto, sleep) nunca deixa um
+  # installed.json truncado no lugar.
   if [ -n "$PYTHON3_BIN" ]; then
-    "$PYTHON3_BIN" "$WRITE_SNAPSHOT_PY" "$tsv" "$SNAPSHOT_PATH"
+    "$PYTHON3_BIN" "$WRITE_SNAPSHOT_PY" "$tsv" "$SNAPSHOT_PATH.tmp"
   else
-    awk -f "$WRITE_SNAPSHOT_AWK" "$tsv" > "$SNAPSHOT_PATH"
+    awk -f "$WRITE_SNAPSHOT_AWK" "$tsv" > "$SNAPSHOT_PATH.tmp"
   fi
+  mv -f "$SNAPSHOT_PATH.tmp" "$SNAPSHOT_PATH"
 }
 
 SNAP_ITEM_LABELS=(); SNAP_ITEM_PATHS=()
 SNAP_BIBLIOTECA_VERSION=""
 
+# read_snapshot: le installed.json e popula SNAP_*. retorna 1 (sem abortar
+# mesmo sob set -e — quem chama usa "read_snapshot || true") se o arquivo
+# existir mas estiver corrompido/truncado; quem chama trata como "sem
+# snapshot" em vez de propagar o traceback cru do python.
 read_snapshot() {
   local tsv="$TMP_DIR/snapshot_out.tsv"
   if [ -n "$PYTHON3_BIN" ]; then
-    "$PYTHON3_BIN" - "$SNAPSHOT_PATH" > "$tsv" <<'PYEOF3'
+    if ! "$PYTHON3_BIN" - "$SNAPSHOT_PATH" > "$tsv" 2>"$TMP_DIR/read_snapshot.err" <<'PYEOF3'
 import json
 import sys
 
@@ -656,6 +683,10 @@ for label in d.get("item_labels", []) or []:
 for path in d.get("item_paths", []) or []:
     print("PATH" + US + str(path))
 PYEOF3
+    then
+      log "aviso: installed.json corrompido/ilegível, tratando como sem registro. detalhe (python3): $(cat "$TMP_DIR/read_snapshot.err" 2>/dev/null)"
+      return 1
+    fi
   else
     awk -f "$PARSE_SNAPSHOT_AWK" "$SNAPSHOT_PATH" > "$tsv"
   fi
@@ -709,17 +740,27 @@ cleanup_plugins_dir() {
       fi
     done
   fi
+}
 
-  if [ "${#ALL_PLUGIN_ROOTS[@]}" -gt 0 ]; then
-    for name in "${ALL_PLUGIN_ROOTS[@]}"; do
-      is_safe_leaf_name "$name" || continue
-      target="$plugins_dir/$name"
-      if [ -e "$target" ]; then
-        rm -rf -- "$target"
-        log "removido (upgrade limpo): $target"
-      fi
-    done
-  fi
+# remove so as raizes de UM plugin (roots_csv), chamada logo antes do unzip
+# DAQUELE plugin especifico — nunca em bloco pra todos os plugins do manifest
+# de uma vez (fix blocker: download/sha falho de um plugin nao pode apagar a
+# copia antiga de OUTRO plugin, nem a dele proprio antes de saber que a nova
+# versao vai substitui-la com sucesso).
+cleanup_plugin_roots() {
+  local plugins_dir="$1" roots_csv="$2"
+  local name target old_ifs
+  old_ifs="$IFS"
+  IFS=','
+  for name in $roots_csv; do
+    is_safe_leaf_name "$name" || continue
+    target="$plugins_dir/$name"
+    if [ -e "$target" ]; then
+      rm -rf -- "$target"
+      log "removido (upgrade limpo): $target"
+    fi
+  done
+  IFS="$old_ifs"
 }
 
 # ---------------------------------------------------------------------------
@@ -781,11 +822,48 @@ PLISTEOF
 }
 
 # ---------------------------------------------------------------------------
+# Lock de concorrencia (launchagent de auto-update x execucao manual sobre o
+# mesmo installed.json/Plugins)
+# ---------------------------------------------------------------------------
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_HELD=1
+    return 0
+  fi
+  # lock existe: se tiver mais de 1h, o dono provavelmente morreu (crash,
+  # forcar-encerrar) — considera travado e toma.
+  local now mtime age
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  if [ "$age" -gt 3600 ]; then
+    log "lock parado há mais de 1h ($LOCK_DIR) — considerado travado, tomando."
+    rm -rf "$LOCK_DIR"
+    # mkdir e atomico: se duas execucoes chegam aqui quase juntas, so uma
+    # consegue criar o dir — quem perde a corrida desiste (nao seta
+    # LOCK_HELD, senao as duas sairiam achando que tem o lock e uma
+    # removeria o lock legitimo da outra no cleanup).
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      LOCK_HELD=1
+      return 0
+    fi
+    return 1
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Instalacao
 # ---------------------------------------------------------------------------
 do_install() {
   log_header
   banner
+
+  if ! acquire_lock; then
+    say "outra operação da biblioteca cura já está em andamento. tente de novo em alguns minutos."
+    exit 0
+  fi
+
   if [ "$QUIET" = "1" ]; then
     # em quiet nao ha terminal pra pedir pra fechar o SketchUp; e trocar
     # arquivos embaixo do programa rodando corromperia a sessao. se estiver
@@ -827,27 +905,34 @@ do_install() {
   # no-op short-circuit (antes de baixar qualquer payload): nada mudou desde a
   # ultima instalacao? entao nao re-extrai — evita trabalho a cada disparo do
   # auto-update. exige: (1) mesma versao da biblioteca no snapshot, (2) todo
-  # item registrado ainda no disco e (3) toda versao do SketchUp detectada AGORA
-  # ja coberta pelo snapshot — assim uma instalacao "so fontes" que depois ganha
-  # um SketchUp novo NAO vira no-op e os plugins entram. qualquer teste que
-  # falhe (path faltando, versao diferente, SketchUp novo) segue instalacao
-  # normal.
+  # item registrado ainda no disco, (3) TODO root de TODO plugin do manifest
+  # ATUAL presente em cada Plugins/ detectado agora (nao basta 1 de N plugins
+  # "cobrir" o dir — pega o caso de um plugin ter falhado numa rodada anterior
+  # e sumido do disco enquanto outro plugin do mesmo dir segue presente) e (4)
+  # toda versao do SketchUp detectada AGORA ja coberta pelo snapshot — assim
+  # uma instalacao "so fontes" que depois ganha um SketchUp novo NAO vira
+  # no-op e os plugins entram. qualquer teste que falhe (path faltando, versao
+  # diferente, SketchUp novo, root de plugin faltando) segue instalacao normal.
   if [ -f "$SNAPSHOT_PATH" ]; then
-    read_snapshot
+    # snapshot corrompido/ilegivel (read_snapshot loga aviso e retorna 1): "||
+    # true" evita abortar sob set -e — SNAP_ITEM_PATHS fica vazio e o no-op
+    # abaixo simplesmente nao dispara, seguindo como instalacao normal.
+    read_snapshot || true
     if [ -n "$BIBLIOTECA_VERSION" ] && [ "$SNAP_BIBLIOTECA_VERSION" = "$BIBLIOTECA_VERSION" ] && [ "${#SNAP_ITEM_PATHS[@]}" -gt 0 ]; then
-      local noop=1 snap_path plugins_dir_c covered sp
+      local noop=1 snap_path plugins_dir_c pi_c root_name_c old_ifs_c
       for snap_path in "${SNAP_ITEM_PATHS[@]}"; do
         [ -e "$snap_path" ] || { noop=0; break; }
       done
       if [ "$noop" = "1" ] && [ "${#VERSION_DIRS[@]}" -gt 0 ]; then
         for plugins_dir_c in "${VERSION_DIRS[@]}"; do
-          covered=0
-          for sp in "${SNAP_ITEM_PATHS[@]}"; do
-            case "$sp" in
-              "$plugins_dir_c"/*) covered=1; break ;;
-            esac
+          for pi_c in "${!PLUGIN_IDS[@]}"; do
+            old_ifs_c="$IFS"
+            IFS=','
+            for root_name_c in ${PLUGIN_ROOTS_CSV[$pi_c]}; do
+              [ -e "$plugins_dir_c/$root_name_c" ] || noop=0
+            done
+            IFS="$old_ifs_c"
           done
-          [ "$covered" = "1" ] || { noop=0; break; }
         done
       fi
       if [ "$noop" = "1" ]; then
@@ -892,7 +977,23 @@ do_install() {
       fi
     done
 
-    # por versao: limpeza (upgrade limpo) + instala os plugins baixados com sucesso
+    # re-checa SketchUp aberto imediatamente antes da 1a escrita destrutiva em
+    # Plugins/: os downloads acima podem levar minutos, o check no topo de
+    # do_install pode estar desatualizado. mesma logica de la: quiet adia
+    # (exit 0), interativo espera fechar.
+    if [ "$QUIET" = "1" ]; then
+      if pgrep -x "SketchUp" >/dev/null 2>&1; then
+        log "quiet: SketchUp aberto (abriu durante o download), adiando update"
+        exit 0
+      fi
+    else
+      wait_sketchup_closed
+    fi
+
+    # por versao: limpeza da lista remove (incondicional) + por plugin, so
+    # remove a raiz antiga e reinstala se o download/sha desta rodada foi ok
+    # (fix blocker: download/sha falho nao pode apagar a copia antiga que
+    # ainda funciona — ela fica intacta e a proxima rodada tenta de novo)
     local vi year_v plugins_dir_v pi root_name root_path
     for vi in "${!VERSION_YEARS[@]}"; do
       year_v="${VERSION_YEARS[$vi]}"
@@ -901,6 +1002,7 @@ do_install() {
 
       for pi in "${!PLUGIN_IDS[@]}"; do
         if [ "${PLUGIN_OK[$pi]}" = "1" ]; then
+          cleanup_plugin_roots "$plugins_dir_v" "${PLUGIN_ROOTS_CSV[$pi]}"
           unzip -oq "$TMP_DIR/payload/${PLUGIN_FILES[$pi]}" -d "$plugins_dir_v"
           log "instalado: ${PLUGIN_NAMES[$pi]} v${PLUGIN_VERSIONS[$pi]} em SketchUp $year_v"
 
@@ -947,6 +1049,14 @@ do_install() {
     log "fontes: manifest sem fontes (fonts: null), etapa pulada."
   fi
 
+  # se algo falhou nesta rodada (HAD_ERROR=1), NAO grava a nova
+  # biblioteca_version — grava a versao antiga do snapshot anterior (ou vazio
+  # se nunca houve snapshot), pra proxima rodada do updater nao cair no no-op
+  # e tentar de novo o que faltou.
+  if [ "$HAD_ERROR" = "1" ]; then
+    BIBLIOTECA_VERSION="$SNAP_BIBLIOTECA_VERSION"
+  fi
+
   write_snapshot
 
   # resumo final (sem separador no stdout em quiet)
@@ -963,6 +1073,11 @@ do_install() {
     # importa — quando o SketchUp aparecer depois, o gatilho instala os plugins
     # (o no-op acima nao dispara nesse caso). register_updater e no-op em quiet.
     register_updater
+    # fonte com falha de integridade (HAD_ERROR=1) e falha real, nao "parcial
+    # limpo" — nao mascarar num exit 1 igual ao caso 100% saudavel.
+    if [ "$HAD_ERROR" = "1" ]; then
+      exit 2
+    fi
     exit 1
   fi
 
@@ -1006,6 +1121,9 @@ do_install() {
   if [ "$HAD_ERROR" = "1" ]; then
     say "$msg"
     log "resumo: instalação parcial (havia item com falha de integridade)"
+    # falha parcial e exatamente quando a retentativa agendada mais importa —
+    # registra igual ao caminho de sucesso (register_updater e no-op em quiet).
+    register_updater
     exit 2
   fi
 
@@ -1026,6 +1144,11 @@ do_uninstall() {
   log_header
   banner
 
+  if ! acquire_lock; then
+    say "outra operação da biblioteca cura já está em andamento. tente de novo em alguns minutos."
+    exit 0
+  fi
+
   if [ ! -f "$SNAPSHOT_PATH" ]; then
     say "nada instalado por este instalador (nenhum registro encontrado em $SNAPSHOT_PATH)."
     exit 0
@@ -1033,7 +1156,18 @@ do_uninstall() {
 
   detect_python3
   write_helper_scripts
-  read_snapshot
+  # snapshot corrompido/ilegivel: read_snapshot loga aviso e retorna 1. esse
+  # caso e tratado separado do "registro vazio" de verdade: preservamos o
+  # installed.json (unica pista do que estava instalado, pro suporte) em vez
+  # de apagar — so removemos quando o arquivo foi lido com sucesso e esta
+  # genuinamente vazio.
+  local snap_read_ok=1
+  read_snapshot || snap_read_ok=0
+
+  if [ "$snap_read_ok" = "0" ]; then
+    say "não foi possível ler o registro de instalação (arquivo corrompido). o arquivo foi mantido em $SNAPSHOT_PATH para o suporte."
+    exit 0
+  fi
 
   if [ "${#SNAP_ITEM_PATHS[@]}" -eq 0 ]; then
     say "nada instalado por este instalador (registro vazio em $SNAPSHOT_PATH)."

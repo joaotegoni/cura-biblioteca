@@ -53,6 +53,7 @@ Regras:
 - `roots` = entradas raiz que o .rbz cria em Plugins/ → snapshot de desinstalação + limpeza de versão velha do próprio plugin antes de instalar.
 - `fonts: null` → pula fontes SEM erro (fontes do João ainda não chegaram). Quando chegarem: `{"file":"fonts.zip","sha256":"...","families":["..."]}`.
 - `remove` = SÓ match exato de nome (arquivo ou pasta) dentro de cada `Plugins/`. NUNCA glob/wildcard. Lista cresce via manifest quando João mandar RAR da 8.0.
+- REGRA OPERACIONAL: renomeou um root de plugin, ou tirou um plugin do manifest? o nome ANTIGO entra na lista `remove` no MESMO release. A limpeza de upgrade só remove roots do plugin que vai ser reinstalado com sucesso (proteção contra download corrompido apagar cópia boa), então root antigo órfão só sai do disco via `remove`.
 - sha256 SEMPRE verificado pós-download. Falhou → aborta item com msg clara, não instala corrompido.
 
 ## Fluxo de instalação (idêntico nas 2 plataformas)
